@@ -1,4 +1,8 @@
 import { useRef, useState } from 'react';
+import pako from 'pako';
+import { Html5Qrcode } from 'html5-qrcode';
+import { QRCodeSVG } from 'qrcode.react';
+
 
 export default function App() {
   const [localSDP, setLocalSDP] = useState('');
@@ -6,17 +10,18 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [status, setStatus] = useState('Not connected');
+  const [scanning, setScanning] = useState(false);
 
   const pc = useRef(null);
   const dc = useRef(null);
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const localStream = useRef(null);
+  const qrScannerRef = useRef(null);
 
   const createConnection = async (isOfferer) => {
     pc.current = new RTCPeerConnection();
 
-    // Get camera + mic
     localStream.current = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     localStream.current.getTracks().forEach((track) => {
       pc.current.addTrack(track, localStream.current);
@@ -28,7 +33,9 @@ export default function App() {
 
     pc.current.onicecandidate = (e) => {
       if (!e.candidate) {
-        setLocalSDP(JSON.stringify(pc.current.localDescription, null, 2));
+        const sdp = JSON.stringify(pc.current.localDescription);
+        const compressed = btoa(pako.deflate(sdp, { to: 'string' }));
+        setLocalSDP(compressed);
       }
     };
 
@@ -62,14 +69,15 @@ export default function App() {
 
   const handleRemoteSDP = async () => {
     try {
-      const desc = JSON.parse(remoteSDP);
+      const decoded = pako.inflate(atob(remoteSDP), { to: 'string' });
+      const desc = JSON.parse(decoded);
       await pc.current.setRemoteDescription(new RTCSessionDescription(desc));
       if (desc.type === 'offer') {
         const answer = await pc.current.createAnswer();
         await pc.current.setLocalDescription(answer);
       }
     } catch (err) {
-      alert('❌ Invalid SDP! Make sure you pasted a full JSON object.');
+      alert('❌ Invalid compressed SDP!');
       console.error(err);
     }
   };
@@ -85,8 +93,8 @@ export default function App() {
   const startScreenShare = async () => {
     const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
     const screenTrack = screenStream.getVideoTracks()[0];
-
     const sender = pc.current.getSenders().find(s => s.track.kind === 'video');
+
     if (sender) {
       sender.replaceTrack(screenTrack);
     }
@@ -96,7 +104,6 @@ export default function App() {
     }
 
     screenTrack.onended = () => {
-      // Revert to webcam after screen share ends
       const camTrack = localStream.current.getVideoTracks()[0];
       if (sender) {
         sender.replaceTrack(camTrack);
@@ -107,11 +114,46 @@ export default function App() {
     };
   };
 
+  const startQRScan = () => {
+    const qrRegionId = "qr-reader";
+    setScanning(true);
+
+    if (!qrScannerRef.current) {
+      qrScannerRef.current = new Html5Qrcode(qrRegionId);
+    }
+
+    qrScannerRef.current.start(
+      { facingMode: "environment" },
+      { fps: 10, qrbox: 250 },
+      (decodedText) => {
+        try {
+          pako.inflate(atob(decodedText), { to: 'string' }); // verify it's valid
+          setRemoteSDP(decodedText);
+          setStatus('✅ QR scanned. Now click "Set Remote Description"');
+          stopQRScan();
+        } catch {
+          alert('❌ Invalid QR code content!');
+        }
+      },
+      (errorMessage) => {
+        console.warn('QR error:', errorMessage);
+      }
+    );
+  };
+
+  const stopQRScan = () => {
+    if (qrScannerRef.current) {
+      qrScannerRef.current.stop().then(() => {
+        setScanning(false);
+      });
+    }
+  };
+
   const isConnected = dc.current && dc.current.readyState === 'open';
 
   return (
     <div style={{ padding: 20, fontFamily: 'Arial, sans-serif' }}>
-      <h2>🌐 WebRTC Chat + Video + Screen Share</h2>
+      <h2>🌐 WebRTC + QR Scanner</h2>
       <p><b>Status:</b> {status}</p>
 
       <button onClick={() => createConnection(true)}>🔵 Create Offer</button>
@@ -119,19 +161,28 @@ export default function App() {
       <button onClick={startScreenShare} style={{ marginLeft: 10 }}>🖥️ Share Screen</button>
 
       <br /><br />
-      <label><b>Paste Remote SDP:</b></label><br />
+      <label><b>Paste or Scan Remote Compressed SDP:</b></label><br />
       <textarea
-        placeholder="Paste the peer's full JSON SDP here"
+        placeholder="Paste compressed SDP here or use QR scanner"
         value={remoteSDP}
         onChange={(e) => setRemoteSDP(e.target.value)}
-        rows="8"
+        rows="5"
         cols="80"
       />
       <br />
       <button onClick={handleRemoteSDP}>✅ Set Remote Description</button>
+      <button onClick={startQRScan} style={{ marginLeft: 10 }}>📷 Scan QR</button>
+      <div id="qr-reader" style={{ width: 300, marginTop: 10 }} hidden={!scanning}></div>
 
-      <h4>📄 Your SDP (copied automatically):</h4>
-      <textarea readOnly value={localSDP} rows="8" cols="80" />
+      <h4>📄 Your Compressed SDP (share as QR):</h4>
+      <textarea readOnly value={localSDP} rows="5" cols="80" />
+
+      {localSDP && (
+        <div style={{ marginTop: 10 }}>
+          <QRCodeSVG value={localSDP} size={256} />
+        </div>
+      )}
+
 
       <hr />
       <h4>📹 Local Video</h4>
