@@ -4,6 +4,8 @@ import { Html5Qrcode } from 'html5-qrcode';
 import { QRCodeSVG } from 'qrcode.react';
 import axios from 'axios';
 
+import './App.css';
+
 export default function App() {
   const [localSDPUrl, setLocalSDPUrl] = useState('');
   const [remoteSDP, setRemoteSDP] = useState('');
@@ -37,7 +39,7 @@ export default function App() {
         JSON.stringify({ sdp: compressedSDP }),
         { headers: { 'Content-Type': 'application/json' } }
       );
-      return response.headers.location;
+      return response.headers.location.replace('http://', 'https://');
     } catch (error) {
       console.error('Failed to upload SDP:', error);
       return '';
@@ -100,7 +102,7 @@ export default function App() {
       if (!compressed) return alert('❌ Remote SDP is empty!');
 
       if (compressed.startsWith('http')) {
-        const { data } = await axios.get(compressed);
+        const { data } = await axios.get(compressed.replace('http://', 'https://'));
         if (!data?.sdp) throw new Error('Missing "sdp" field in blob');
         compressed = data.sdp;
       }
@@ -177,64 +179,74 @@ export default function App() {
   const isConnected = dc.current?.readyState === 'open';
 
   return (
-    <div style={{ padding: 20, fontFamily: 'Arial' }}>
-      <h2>🌐 WebRTC + QR Code Signaling</h2>
-      <p><b>Status:</b> {status}</p>
-
-      <div style={{ marginBottom: 10 }}>
-        <button onClick={() => createConnection(true)}>🔵 Create Offer</button>
-        <button onClick={() => createConnection(false)} style={{ marginLeft: 10 }}>🟢 Create Answer</button>
-        <button onClick={startScreenShare} style={{ marginLeft: 10 }}>🖥️ Share Screen</button>
-      </div>
-
-      <label><b>Paste or Scan Remote SDP / URL:</b></label><br />
-      <textarea
-        placeholder="Paste compressed SDP or jsonblob link"
-        value={remoteSDP}
-        onChange={(e) => setRemoteSDP(e.target.value)}
-        rows="4"
-        cols="80"
-      /><br />
-      <button onClick={handleRemoteSDP}>✅ Set Remote Description</button>
-      <button onClick={startQRScan} style={{ marginLeft: 10 }}>📷 Scan QR</button>
-
-      <div id="qr-reader" style={{ width: 300, marginTop: 10 }} hidden={!scanning}></div>
-
-      <h4>📄 Your Compressed SDP URL (Share):</h4>
-      <textarea readOnly value={localSDPUrl} rows="2" cols="80" />
-      {localSDPUrl && (
-        <div style={{ marginTop: 10 }}>
-          <QRCodeSVG value={localSDPUrl} size={256} />
+    <div className="app-wrapper dark-theme">
+      <aside className="sidebar">
+        <h1 className="logo">tx</h1>
+        <div className="sidebar-buttons">
+          <button onClick={() => createConnection(true)}>🔵 Make Connection</button>
+          <button onClick={() => createConnection(false)}>🟢 Get Connection</button>
+          <button onClick={startScreenShare}>🖥️ Share Screen</button>
         </div>
-      )}
+        <div className="status-box">
+          <p>Status: <span className="status">{status}</span></p>
+        </div>
+      </aside>
 
-      <hr />
-      <h4>📹 Local Video</h4>
-      <video ref={localVideoRef} autoPlay playsInline muted width="300" />
-
-      <h4>🖥️ Remote Video</h4>
-      <video ref={remoteVideoRef} autoPlay playsInline width="300" />
-
-      <hr />
-      <h4>💬 Chat</h4>
-      <div style={{ border: '1px solid gray', padding: 10, minHeight: 100, maxHeight: 200, overflowY: 'auto' }}>
-        {messages.map((msg, i) => (
-          <div key={i}><b>{msg.from}:</b> {msg.text}</div>
-        ))}
-      </div>
-
-      {isConnected && (
-        <div style={{ marginTop: 10 }}>
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Type message..."
-            style={{ width: 300, padding: 6 }}
+      <main className="main-content">
+        <section className="remote-sdp">
+          <h2>🔗 Remote SDP or Link</h2>
+          <textarea
+            placeholder="Paste compressed SDP or jsonblob link"
+            value={remoteSDP}
+            onChange={(e) => setRemoteSDP(e.target.value)}
+            rows="4"
           />
-          <button onClick={sendMessage} style={{ marginLeft: 10 }}>Send</button>
-        </div>
-      )}
+          <div className="actions">
+            <button onClick={handleRemoteSDP}>✅ Set Remote</button>
+            <button onClick={startQRScan}>📷 Scan QR</button>
+          </div>
+          <div id="qr-reader" className={scanning ? 'qr-visible' : 'qr-hidden'} />
+        </section>
+
+        {localSDPUrl && (
+          <section className="sdp-display">
+            <h2>📄 Share This URL</h2>
+            <textarea readOnly value={localSDPUrl} rows="2" />
+            <QRCodeSVG value={localSDPUrl} size={192} />
+          </section>
+        )}
+
+        <section className="video-grid">
+          <div className="video-box">
+            <h3>📹 Local</h3>
+            <video ref={localVideoRef} autoPlay playsInline muted />
+          </div>
+          <div className="video-box">
+            <h3>🖥️ Remote</h3>
+            <video ref={remoteVideoRef} autoPlay playsInline />
+          </div>
+        </section>
+
+        <section className="chat-section">
+          <h2>💬 Chat</h2>
+          <div className="chat-box">
+            {messages.map((msg, i) => (
+              <div key={i}><strong>{msg.from}:</strong> {msg.text}</div>
+            ))}
+          </div>
+          {isConnected && (
+            <div className="chat-input">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type message..."
+              />
+              <button onClick={sendMessage}>Send</button>
+            </div>
+          )}
+        </section>
+      </main>
     </div>
   );
 }
