@@ -2,10 +2,11 @@ import { useRef, useState } from 'react';
 import pako from 'pako';
 import { Html5Qrcode } from 'html5-qrcode';
 import { QRCodeSVG } from 'qrcode.react';
-
+import axios from 'axios';
 
 export default function App() {
   const [localSDP, setLocalSDP] = useState('');
+  const [localSDPUrl, setLocalSDPUrl] = useState('');
   const [remoteSDP, setRemoteSDP] = useState('');
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -19,6 +20,18 @@ export default function App() {
   const localStream = useRef(null);
   const qrScannerRef = useRef(null);
 
+  const uploadSDPToJsonBlob = async (sdpString) => {
+    try {
+      const response = await axios.post('https://jsonblob.com/api/jsonBlob', sdpString, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+      return response.headers.location;
+    } catch (error) {
+      console.error('Failed to upload SDP:', error);
+      return '';
+    }
+  };
+
   const createConnection = async (isOfferer) => {
     pc.current = new RTCPeerConnection();
 
@@ -31,11 +44,14 @@ export default function App() {
       localVideoRef.current.srcObject = localStream.current;
     }
 
-    pc.current.onicecandidate = (e) => {
+    pc.current.onicecandidate = async (e) => {
       if (!e.candidate) {
         const sdp = JSON.stringify(pc.current.localDescription);
         const compressed = btoa(pako.deflate(sdp, { to: 'string' }));
         setLocalSDP(compressed);
+
+        const url = await uploadSDPToJsonBlob(JSON.stringify({ sdp: compressed }));
+        setLocalSDPUrl(url);
       }
     };
 
@@ -46,13 +62,13 @@ export default function App() {
     };
 
     if (isOfferer) {
-      setStatus('Offer created. Share SDP with peer.');
+      setStatus('Offer created. Share SDP link with peer.');
       dc.current = pc.current.createDataChannel('chat');
       setupDataChannel(dc.current);
       const offer = await pc.current.createOffer();
       await pc.current.setLocalDescription(offer);
     } else {
-      setStatus('Answer created. Send SDP back to peer.');
+      setStatus('Answer created. Send SDP link back to peer.');
       pc.current.ondatachannel = (event) => {
         dc.current = event.channel;
         setupDataChannel(dc.current);
@@ -69,7 +85,15 @@ export default function App() {
 
   const handleRemoteSDP = async () => {
     try {
-      const decoded = pako.inflate(atob(remoteSDP), { to: 'string' });
+      let compressed = remoteSDP;
+
+      // If it's a jsonblob URL, fetch the data
+      if (compressed.startsWith('http')) {
+        const { data } = await axios.get(compressed);
+        compressed = data.sdp;
+      }
+
+      const decoded = pako.inflate(atob(compressed), { to: 'string' });
       const desc = JSON.parse(decoded);
       await pc.current.setRemoteDescription(new RTCSessionDescription(desc));
       if (desc.type === 'offer') {
@@ -77,7 +101,7 @@ export default function App() {
         await pc.current.setLocalDescription(answer);
       }
     } catch (err) {
-      alert('❌ Invalid compressed SDP!');
+      alert('❌ Invalid SDP or QR code content!');
       console.error(err);
     }
   };
@@ -126,14 +150,9 @@ export default function App() {
       { facingMode: "environment" },
       { fps: 10, qrbox: 250 },
       (decodedText) => {
-        try {
-          pako.inflate(atob(decodedText), { to: 'string' }); // verify it's valid
-          setRemoteSDP(decodedText);
-          setStatus('✅ QR scanned. Now click "Set Remote Description"');
-          stopQRScan();
-        } catch {
-          alert('❌ Invalid QR code content!');
-        }
+        setRemoteSDP(decodedText);
+        setStatus('✅ QR scanned. Now click "Set Remote Description"');
+        stopQRScan();
       },
       (errorMessage) => {
         console.warn('QR error:', errorMessage);
@@ -161,9 +180,9 @@ export default function App() {
       <button onClick={startScreenShare} style={{ marginLeft: 10 }}>🖥️ Share Screen</button>
 
       <br /><br />
-      <label><b>Paste or Scan Remote Compressed SDP:</b></label><br />
+      <label><b>Paste or Scan Remote SDP or URL:</b></label><br />
       <textarea
-        placeholder="Paste compressed SDP here or use QR scanner"
+        placeholder="Paste compressed SDP or jsonblob.com link"
         value={remoteSDP}
         onChange={(e) => setRemoteSDP(e.target.value)}
         rows="5"
@@ -174,15 +193,14 @@ export default function App() {
       <button onClick={startQRScan} style={{ marginLeft: 10 }}>📷 Scan QR</button>
       <div id="qr-reader" style={{ width: 300, marginTop: 10 }} hidden={!scanning}></div>
 
-      <h4>📄 Your Compressed SDP (share as QR):</h4>
-      <textarea readOnly value={localSDP} rows="5" cols="80" />
+      <h4>📄 Your Compressed SDP URL (share this):</h4>
+      <textarea readOnly value={localSDPUrl} rows="2" cols="80" />
 
-      {localSDP && (
+      {localSDPUrl && (
         <div style={{ marginTop: 10 }}>
-          <QRCodeSVG value={localSDP} size={256} />
+          <QRCodeSVG value={localSDPUrl} size={256} />
         </div>
       )}
-
 
       <hr />
       <h4>📹 Local Video</h4>
