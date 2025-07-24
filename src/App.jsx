@@ -4,7 +4,7 @@ import { Html5Qrcode } from 'html5-qrcode';
 import { QRCodeSVG } from 'qrcode.react';
 import axios from 'axios';
 
-import './App.css';
+//import './App.css';
 
 export default function App() {
   const [localSDPUrl, setLocalSDPUrl] = useState('');
