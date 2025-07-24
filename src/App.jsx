@@ -5,7 +5,6 @@ import { QRCodeSVG } from 'qrcode.react';
 import axios from 'axios';
 
 export default function App() {
-  const [localSDP, setLocalSDP] = useState('');
   const [localSDPUrl, setLocalSDPUrl] = useState('');
   const [remoteSDP, setRemoteSDP] = useState('');
   const [messages, setMessages] = useState([]);
@@ -20,11 +19,24 @@ export default function App() {
   const localStream = useRef(null);
   const qrScannerRef = useRef(null);
 
-  const uploadSDPToJsonBlob = async (sdpString) => {
+  const compress = (str) => {
+    const compressed = pako.deflate(str);
+    return btoa(String.fromCharCode(...compressed));
+  };
+
+  const decompress = (base64) => {
+    const binary = atob(base64);
+    const uint8 = Uint8Array.from(binary, c => c.charCodeAt(0));
+    return pako.inflate(uint8, { to: 'string' });
+  };
+
+  const uploadSDPToJsonBlob = async (compressedSDP) => {
     try {
-      const response = await axios.post('https://jsonblob.com/api/jsonBlob', sdpString, {
-        headers: { 'Content-Type': 'application/json' }
-      });
+      const response = await axios.post(
+        'https://jsonblob.com/api/jsonBlob',
+        JSON.stringify({ sdp: compressedSDP }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
       return response.headers.location;
     } catch (error) {
       console.error('Failed to upload SDP:', error);
@@ -36,7 +48,7 @@ export default function App() {
     pc.current = new RTCPeerConnection();
 
     localStream.current = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    localStream.current.getTracks().forEach((track) => {
+    localStream.current.getTracks().forEach(track => {
       pc.current.addTrack(track, localStream.current);
     });
 
@@ -44,20 +56,18 @@ export default function App() {
       localVideoRef.current.srcObject = localStream.current;
     }
 
-    pc.current.onicecandidate = async (e) => {
-      if (!e.candidate) {
-        const sdp = JSON.stringify(pc.current.localDescription);
-        const compressed = btoa(pako.deflate(sdp, { to: 'string' }));
-        setLocalSDP(compressed);
-
-        const url = await uploadSDPToJsonBlob(JSON.stringify({ sdp: compressed }));
-        setLocalSDPUrl(url);
+    pc.current.ontrack = (e) => {
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = e.streams[0];
       }
     };
 
-    pc.current.ontrack = (event) => {
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = event.streams[0];
+    pc.current.onicecandidate = async (e) => {
+      if (!e.candidate) {
+        const sdp = JSON.stringify(pc.current.localDescription);
+        const compressed = compress(sdp);
+        const url = await uploadSDPToJsonBlob(compressed);
+        setLocalSDPUrl(url);
       }
     };
 
@@ -85,29 +95,38 @@ export default function App() {
 
   const handleRemoteSDP = async () => {
     try {
-      let compressed = remoteSDP;
+      let compressed = remoteSDP.trim();
 
-      // If it's a jsonblob URL, fetch the data
+      if (!compressed) return alert('❌ Remote SDP is empty!');
+
       if (compressed.startsWith('http')) {
         const { data } = await axios.get(compressed);
+        if (!data?.sdp) throw new Error('Missing "sdp" field in blob');
         compressed = data.sdp;
       }
 
-      const decoded = pako.inflate(atob(compressed), { to: 'string' });
-      const desc = JSON.parse(decoded);
+      const inflated = decompress(compressed);
+      const desc = JSON.parse(inflated);
+
+      if (!desc?.type || !desc?.sdp) throw new Error('Invalid SDP object');
+
       await pc.current.setRemoteDescription(new RTCSessionDescription(desc));
+
       if (desc.type === 'offer') {
         const answer = await pc.current.createAnswer();
         await pc.current.setLocalDescription(answer);
+        setStatus('📡 Answer sent.');
+      } else {
+        setStatus('✅ Remote description set.');
       }
     } catch (err) {
-      alert('❌ Invalid SDP or QR code content!');
+      alert('❌ Invalid SDP or QR code content!\n\n' + err.message);
       console.error(err);
     }
   };
 
   const sendMessage = () => {
-    if (dc.current && input.trim()) {
+    if (dc.current?.readyState === 'open' && input.trim()) {
       dc.current.send(input);
       setMessages((prev) => [...prev, { from: 'me', text: input }]);
       setInput('');
@@ -119,22 +138,13 @@ export default function App() {
     const screenTrack = screenStream.getVideoTracks()[0];
     const sender = pc.current.getSenders().find(s => s.track.kind === 'video');
 
-    if (sender) {
-      sender.replaceTrack(screenTrack);
-    }
-
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = screenStream;
-    }
+    if (sender) sender.replaceTrack(screenTrack);
+    if (localVideoRef.current) localVideoRef.current.srcObject = screenStream;
 
     screenTrack.onended = () => {
       const camTrack = localStream.current.getVideoTracks()[0];
-      if (sender) {
-        sender.replaceTrack(camTrack);
-      }
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = localStream.current;
-      }
+      if (sender) sender.replaceTrack(camTrack);
+      if (localVideoRef.current) localVideoRef.current.srcObject = localStream.current;
     };
   };
 
@@ -154,48 +164,44 @@ export default function App() {
         setStatus('✅ QR scanned. Now click "Set Remote Description"');
         stopQRScan();
       },
-      (errorMessage) => {
-        console.warn('QR error:', errorMessage);
-      }
+      (err) => console.warn('QR scan error:', err)
     );
   };
 
   const stopQRScan = () => {
     if (qrScannerRef.current) {
-      qrScannerRef.current.stop().then(() => {
-        setScanning(false);
-      });
+      qrScannerRef.current.stop().then(() => setScanning(false));
     }
   };
 
-  const isConnected = dc.current && dc.current.readyState === 'open';
+  const isConnected = dc.current?.readyState === 'open';
 
   return (
-    <div style={{ padding: 20, fontFamily: 'Arial, sans-serif' }}>
-      <h2>🌐 WebRTC + QR Scanner</h2>
+    <div style={{ padding: 20, fontFamily: 'Arial' }}>
+      <h2>🌐 WebRTC + QR Code Signaling</h2>
       <p><b>Status:</b> {status}</p>
 
-      <button onClick={() => createConnection(true)}>🔵 Create Offer</button>
-      <button onClick={() => createConnection(false)} style={{ marginLeft: 10 }}>🟢 Create Answer</button>
-      <button onClick={startScreenShare} style={{ marginLeft: 10 }}>🖥️ Share Screen</button>
+      <div style={{ marginBottom: 10 }}>
+        <button onClick={() => createConnection(true)}>🔵 Create Offer</button>
+        <button onClick={() => createConnection(false)} style={{ marginLeft: 10 }}>🟢 Create Answer</button>
+        <button onClick={startScreenShare} style={{ marginLeft: 10 }}>🖥️ Share Screen</button>
+      </div>
 
-      <br /><br />
-      <label><b>Paste or Scan Remote SDP or URL:</b></label><br />
+      <label><b>Paste or Scan Remote SDP / URL:</b></label><br />
       <textarea
-        placeholder="Paste compressed SDP or jsonblob.com link"
+        placeholder="Paste compressed SDP or jsonblob link"
         value={remoteSDP}
         onChange={(e) => setRemoteSDP(e.target.value)}
-        rows="5"
+        rows="4"
         cols="80"
-      />
-      <br />
+      /><br />
       <button onClick={handleRemoteSDP}>✅ Set Remote Description</button>
       <button onClick={startQRScan} style={{ marginLeft: 10 }}>📷 Scan QR</button>
+
       <div id="qr-reader" style={{ width: 300, marginTop: 10 }} hidden={!scanning}></div>
 
-      <h4>📄 Your Compressed SDP URL (share this):</h4>
+      <h4>📄 Your Compressed SDP URL (Share):</h4>
       <textarea readOnly value={localSDPUrl} rows="2" cols="80" />
-
       {localSDPUrl && (
         <div style={{ marginTop: 10 }}>
           <QRCodeSVG value={localSDPUrl} size={256} />
@@ -223,8 +229,8 @@ export default function App() {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Type a message"
-            style={{ width: 300, padding: '6px' }}
+            placeholder="Type message..."
+            style={{ width: 300, padding: 6 }}
           />
           <button onClick={sendMessage} style={{ marginLeft: 10 }}>Send</button>
         </div>
