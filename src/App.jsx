@@ -47,6 +47,10 @@ export default function App() {
   };
 
   const createConnection = async (isOfferer) => {
+    if (pc.current) {
+      pc.current.close();
+    }
+
     pc.current = new RTCPeerConnection();
 
     localStream.current = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
@@ -58,14 +62,18 @@ export default function App() {
       localVideoRef.current.srcObject = localStream.current;
     }
 
+    let remoteStreamSet = false;
     pc.current.ontrack = (e) => {
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = e.streams[0];
+      if (!remoteStreamSet) {
+        remoteStreamSet = true;
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = e.streams[0];
+        }
       }
     };
 
     pc.current.onicecandidate = async (e) => {
-      if (!e.candidate) {
+      if (!e.candidate && isOfferer) {
         const sdp = JSON.stringify(pc.current.localDescription);
         const compressed = compress(sdp);
         const url = await uploadSDPToJsonBlob(compressed);
@@ -77,28 +85,30 @@ export default function App() {
       setStatus('Offer created. Share SDP link with peer.');
       dc.current = pc.current.createDataChannel('chat');
       setupDataChannel(dc.current);
+
       const offer = await pc.current.createOffer();
       await pc.current.setLocalDescription(offer);
     } else {
-      setStatus('Answer created. Send SDP link back to peer.');
+      setStatus('Ready to receive offer.');
       pc.current.ondatachannel = (event) => {
-        dc.current = event.channel;
-        setupDataChannel(dc.current);
+        setupDataChannel(event.channel);
       };
     }
   };
 
   const setupDataChannel = (channel) => {
-    channel.onopen = () => setStatus('Connected ✅');
-    channel.onmessage = (e) => {
-      setMessages((prev) => [...prev, { from: 'peer', text: e.data }]);
+    dc.current = channel;
+    dc.current.onopen = () => {
+      setStatus('Connected ✅');
+    };
+    dc.current.onmessage = (e) => {
+      setMessages(prev => [...prev, { from: 'peer', text: e.data }]);
     };
   };
 
-  const handleRemoteSDP = async () => {
+  const handleRemoteSDP = async (input) => {
     try {
-      let compressed = remoteSDP.trim();
-
+      let compressed = (input || remoteSDP).trim();
       if (!compressed) return alert('❌ Remote SDP is empty!');
 
       if (compressed.startsWith('http')) {
@@ -144,13 +154,15 @@ export default function App() {
     if (localVideoRef.current) localVideoRef.current.srcObject = screenStream;
 
     screenTrack.onended = () => {
-      const camTrack = localStream.current.getVideoTracks()[0];
-      if (sender) sender.replaceTrack(camTrack);
-      if (localVideoRef.current) localVideoRef.current.srcObject = localStream.current;
+      const camTrack = localStream.current?.getVideoTracks()?.[0];
+      if (sender && camTrack) {
+        sender.replaceTrack(camTrack);
+        if (localVideoRef.current) localVideoRef.current.srcObject = localStream.current;
+      }
     };
   };
 
-  const startQRScan = () => {
+  const startQRScan = async () => {
     const qrRegionId = "qr-reader";
     setScanning(true);
 
@@ -158,13 +170,18 @@ export default function App() {
       qrScannerRef.current = new Html5Qrcode(qrRegionId);
     }
 
-    qrScannerRef.current.start(
+    await qrScannerRef.current.start(
       { facingMode: "environment" },
       { fps: 10, qrbox: 250 },
-      (decodedText) => {
+      async (decodedText) => {
+        console.log("Scanned:", decodedText);
         setRemoteSDP(decodedText);
-        setStatus('✅ QR scanned. Now click "Set Remote Description"');
+        setStatus('✅ QR scanned. Now setting Remote Description...');
+
         stopQRScan();
+
+        await createConnection(false);
+        await handleRemoteSDP(decodedText);
       },
       (err) => console.warn('QR scan error:', err)
     );
@@ -183,18 +200,17 @@ export default function App() {
       <aside className="sidebar">
         <h1 className="logo">tx</h1>
         <div className="sidebar-buttons">
-          <button onClick={() => createConnection(true)}>🔵 Make Connection</button>
-          <button onClick={() => createConnection(false)}>🟢 Get Connection</button>
+          <button onClick={() => createConnection(true)}>Make Connection</button>
+          <button onClick={() => startQRScan()}>Scan & Join</button>
           <button onClick={startScreenShare}>🖥️ Share Screen</button>
         </div>
         <div className="status-box">
-          <p>Status: <span className="status">{status}</span></p>
+          <p><span className="status">{status}</span></p>
         </div>
       </aside>
 
       <main className="main-content">
         <section className="remote-sdp">
-          <h2>🔗 Remote SDP or Link</h2>
           <textarea
             placeholder="Paste compressed SDP or jsonblob link"
             value={remoteSDP}
@@ -202,8 +218,8 @@ export default function App() {
             rows="4"
           />
           <div className="actions">
-            <button onClick={handleRemoteSDP}>✅ Set Remote</button>
-            <button onClick={startQRScan}>📷 Scan QR</button>
+            <button onClick={() => createConnection(false)}>⬇️ Start Receiving</button>
+            <button onClick={() => handleRemoteSDP()}>✅ Set Remote</button>
           </div>
           <div id="qr-reader" className={scanning ? 'qr-visible' : 'qr-hidden'} />
         </section>
@@ -212,7 +228,9 @@ export default function App() {
           <section className="sdp-display">
             <h2>📄 Share This URL</h2>
             <textarea readOnly value={localSDPUrl} rows="2" />
-            <QRCodeSVG value={localSDPUrl} size={192} />
+            <div className='QRbackground'>
+              <QRCodeSVG value={localSDPUrl} size={192} />
+            </div>
           </section>
         )}
 
