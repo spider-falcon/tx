@@ -1,4 +1,6 @@
 // db.js - IndexedDB helper for chats, calls, albums, files and blobs
+// Improved and extended: safer transaction promisification, additional helpers
+
 const DB_NAME = "webrtc_local";
 const DB_VERSION = 1;
 
@@ -12,7 +14,11 @@ function openDB() {
       if (!db.objectStoreNames.contains("albums")) db.createObjectStore("albums", { keyPath: "id" });
       if (!db.objectStoreNames.contains("files")) {
         const store = db.createObjectStore("files", { keyPath: "id" });
-        store.createIndex("albumId", "albumId", { unique: false });
+        try {
+          store.createIndex("albumId", "albumId", { unique: false });
+        } catch (e) {
+          // ignore if index exists in some browsers
+        }
       }
       if (!db.objectStoreNames.contains("blobs")) db.createObjectStore("blobs"); // key provided manually
     };
@@ -21,10 +27,20 @@ function openDB() {
   });
 }
 
+// promisify individual requests (IDBRequest)
 function promisifyRequest(req) {
   return new Promise((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+  });
+}
+
+// promisify a transaction's completion
+function promisifyTransaction(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('Transaction failed'));
+    tx.onabort = () => reject(tx.error || new Error('Transaction aborted'));
   });
 }
 
@@ -35,7 +51,8 @@ export async function saveCall(callData) {
   const store = tx.objectStore("calls");
   const item = { ...callData, timestamp: callData.timestamp || Date.now() };
   store.put(item);
-  return promisifyRequest(tx);
+  await promisifyTransaction(tx);
+  return item.timestamp;
 }
 
 export async function getRecentCalls(limit = 10) {
@@ -45,6 +62,14 @@ export async function getRecentCalls(limit = 10) {
   return (all || []).sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
 }
 
+export async function clearCalls() {
+  const db = await openDB();
+  const tx = db.transaction("calls", "readwrite");
+  tx.objectStore("calls").clear();
+  await promisifyTransaction(tx);
+  return true;
+}
+
 /* Chats */
 export async function saveChat(chatData) {
   const db = await openDB();
@@ -52,14 +77,24 @@ export async function saveChat(chatData) {
   const store = tx.objectStore("chats");
   const item = { ...chatData, timestamp: chatData.timestamp || Date.now() };
   store.put(item);
-  return promisifyRequest(tx);
+  await promisifyTransaction(tx);
+  return item.timestamp;
 }
 
 export async function getChatHistory(limit = 10) {
   const db = await openDB();
   const store = db.transaction("chats", "readonly").objectStore("chats");
   const all = await promisifyRequest(store.getAll());
+  // return most recent first
   return (all || []).sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
+}
+
+export async function clearChats() {
+  const db = await openDB();
+  const tx = db.transaction("chats", "readwrite");
+  tx.objectStore("chats").clear();
+  await promisifyTransaction(tx);
+  return true;
 }
 
 /* Albums */
@@ -69,7 +104,7 @@ export async function saveAlbum(album) {
   const store = tx.objectStore("albums");
   const item = { ...album, ts: album.ts || Date.now() };
   store.put(item);
-  await promisifyRequest(tx);
+  await promisifyTransaction(tx);
   return item.id;
 }
 
@@ -78,6 +113,27 @@ export async function getAlbums() {
   const store = db.transaction("albums", "readonly").objectStore("albums");
   const all = await promisifyRequest(store.getAll());
   return all || [];
+}
+
+export async function deleteAlbum(id) {
+  const db = await openDB();
+  const tx = db.transaction(["albums", "files"], "readwrite");
+  tx.objectStore("albums").delete(id);
+  // optionally clear albumId on files (keep files but detach)
+  try {
+    const filesStore = tx.objectStore("files");
+    const allFiles = await new Promise((res, rej) => { const r = filesStore.getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    for (const f of allFiles) {
+      if (f.albumId === id) {
+        f.albumId = null;
+        filesStore.put(f);
+      }
+    }
+  } catch (e) {
+    // ignore best-effort
+  }
+  await promisifyTransaction(tx);
+  return true;
 }
 
 /* Files metadata */
@@ -92,7 +148,7 @@ export async function saveFileMeta(metaOrId, albumId = null) {
     const existing = await promisifyRequest(store.get(id));
     const updated = { ...(existing || { id }), albumId: albumId ?? existing?.albumId ?? null, ts: Date.now(), ...(existing || {}) };
     store.put(updated);
-    await promisifyRequest(tx);
+    await promisifyTransaction(tx);
     return updated.id;
   } else if (typeof metaOrId === "object" && metaOrId !== null) {
     const meta = { ...metaOrId };
@@ -100,7 +156,7 @@ export async function saveFileMeta(metaOrId, albumId = null) {
     meta.ts = meta.ts || Date.now();
     if (!meta.id) meta.id = meta.id || Math.random().toString(36).slice(2, 9);
     store.put(meta);
-    await promisifyRequest(tx);
+    await promisifyTransaction(tx);
     return meta.id;
   } else {
     throw new Error("saveFileMeta: invalid arguments");
@@ -121,6 +177,20 @@ export async function getFilesForAlbum(albumId) {
     const all = await promisifyRequest(store.getAll());
     return (all || []).filter((f) => f.albumId === albumId);
   }
+}
+
+export async function getFileMeta(id) {
+  const db = await openDB();
+  const store = db.transaction("files", "readonly").objectStore("files");
+  const meta = await promisifyRequest(store.get(id));
+  return meta || null;
+}
+
+export async function getAllFiles() {
+  const db = await openDB();
+  const store = db.transaction("files", "readonly").objectStore("files");
+  const all = await promisifyRequest(store.getAll());
+  return all || [];
 }
 
 /* Blobs (binary content) */
@@ -145,7 +215,7 @@ export async function saveFileBlob(metaOrId, blob) {
   }
 
   blobs.put(blob, id);
-  await promisifyRequest(tx);
+  await promisifyTransaction(tx);
   return id;
 }
 
@@ -162,6 +232,15 @@ export async function deleteFile(id) {
   const tx = db.transaction(["files", "blobs"], "readwrite");
   tx.objectStore("files").delete(id);
   tx.objectStore("blobs").delete(id);
-  await promisifyRequest(tx);
+  await promisifyTransaction(tx);
+  return true;
+}
+
+// convenience: clear all stored data (useful during development)
+export async function clearAllData() {
+  const db = await openDB();
+  const tx = db.transaction(["calls", "chats", "albums", "files", "blobs"], "readwrite");
+  for (const storeName of ["calls", "chats", "albums", "files", "blobs"]) tx.objectStore(storeName).clear();
+  await promisifyTransaction(tx);
   return true;
 }

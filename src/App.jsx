@@ -1,4 +1,3 @@
-// App.jsx (upgraded - preserves all previous features + new ones)
 import { useEffect, useRef, useState } from "react";
 import pako from "pako";
 import { Html5Qrcode } from "html5-qrcode";
@@ -54,6 +53,8 @@ export default function App() {
   const [editingId, setEditingId] = useState(null);
   const [editingText, setEditingText] = useState("");
   const [deletedUndoQueue, setDeletedUndoQueue] = useState({}); // id -> timeoutId
+  const [connected, setConnected] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   // refs
   const pc = useRef(null);
@@ -67,6 +68,8 @@ export default function App() {
   const incomingFileBuffers = useRef({}); // transferId -> {meta, receivedBytes, buffers}
   const outgoingFileQueue = useRef({}); // transferId -> {file, meta, offset}
   const sendTypingTimeout = useRef(null);
+  const screenSenderRef = useRef(null); // store the RTCRtpSender for screen share
+  const originalVideoTrackRef = useRef(null);
 
   // init
   useEffect(() => {
@@ -135,7 +138,8 @@ export default function App() {
     pcInstance.oniceconnectionstatechange = () => {
       const s = pcInstance.iceConnectionState;
       setStatus((prev) => (s === "connected" ? "✅ Connected!" : prev));
-      if (s === "disconnected" || s === "failed") setStatus("⚠️ Connection lost");
+      if (s === "connected") setConnected(true);
+      if (s === "disconnected" || s === "failed") { setStatus("⚠️ Connection lost"); setConnected(false); }
     };
     pcInstance.onicecandidate = async (e) => {
       if (!e.candidate) {
@@ -151,6 +155,7 @@ export default function App() {
   const setupDataChannel = (channel) => {
     channel.onopen = () => {
       setStatus("✅ Connected!");
+      setConnected(true);
       sendSignal({ type: "presence", payload: { username } });
     };
     channel.onmessage = (ev) => {
@@ -161,7 +166,7 @@ export default function App() {
         setMessages((m) => [...m, { id: uid(), from: "peer", type: "text", text: ev.data, ts: nowTs(), delivered: true }]);
       }
     };
-    channel.onclose = () => setStatus("📴 Data channel closed");
+    channel.onclose = () => { setStatus("📴 Data channel closed"); setConnected(false); };
   };
 
   // create caller
@@ -266,7 +271,7 @@ export default function App() {
         // add to shared album default if not provided
         let albumId = obj.albumId || payload.albumId || null;
         if (!albumId) {
-          const newAlbum = { id: `shared_${uid()}`, name: "Shared Album", owner: "peer", ts: nowTs() };
+          const newAlbum = { id: `shared_${uid()}`, name: "Shared Album", owner: payload.from || "peer", ts: nowTs() };
           await saveAlbum(newAlbum);
           setAlbums(await getAlbums());
           albumId = newAlbum.id;
@@ -274,8 +279,8 @@ export default function App() {
         await saveFileMeta(fileId, albumId);
         setFileTransfers((t) => ({ ...t, [transferId]: { ...(t[transferId] || {}), progress: 100, state: "done", fileId } }));
         delete incomingFileBuffers.current[transferId];
-        // notify user
-        setMessages((m) => [...m, { id: uid(), from: "system", type: "system", text: `Received file "${obj.meta.name}"`, ts: nowTs() }]);
+        // notify user (more helpful message)
+        setMessages((m) => [...m, { id: uid(), from: "system", type: "system", text: `Received file "${obj.meta.name}" (${Math.round(obj.meta.size/1024)} KB). Click download in Transfers to save.`, ts: nowTs() }]);
       }
     } else if (type === "file-ready") {
       // remote ready to receive; start sending chunks
@@ -285,6 +290,12 @@ export default function App() {
       const { album } = payload;
       await saveAlbum(album);
       setAlbums(await getAlbums());
+    } else if (type === "control") {
+      // control commands: remote can request actions (mute/video/screen)
+      const { cmd } = payload;
+      if (cmd === "mute") toggleMute();
+      if (cmd === "video-off") toggleVideo();
+      if (cmd === "clear-chat") setMessages([]);
     }
   };
 
@@ -300,7 +311,7 @@ export default function App() {
     const msgObj = { id: uid(), from: username || "me", type: "text", text: text.trim(), ts: nowTs(), delivered: false };
     setMessages((m) => [...m, msgObj]);
     sendSignal({ type: "chat", payload: msgObj });
-    setInput("");
+    setInput(""); // clear input after send
   };
 
   const sendTyping = () => {
@@ -368,6 +379,10 @@ export default function App() {
   // controls
   const toggleMute = () => { localStream.current?.getAudioTracks().forEach((t) => (t.enabled = !t.enabled)); setMuted((m) => !m); };
   const toggleVideo = () => { localStream.current?.getVideoTracks().forEach((t) => (t.enabled = !t.enabled)); setVideoOn((v) => !v); };
+
+  // send a control command to peer (they will perform same action if using same app)
+  const sendControl = (cmd) => { sendSignal({ type: 'control', payload: { cmd } }); };
+
   const endCall = () => {
     dc.current?.close(); pc.current?.close(); localStream.current?.getTracks().forEach((t) => t.stop());
     localVideoRef.current && (localVideoRef.current.srcObject = null);
@@ -375,7 +390,28 @@ export default function App() {
     saveCall({ remoteSDP, status, video: videoOn, muted, username });
     saveChat({ username, messages });
     pc.current = null; dc.current = null; stopStats();
+    setConnected(false);
     setStatus("📴 Call ended");
+  };
+
+  // screen share (local)
+  const startScreenShare = async () => {
+    if (!pc.current) return alert('Not in call');
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const track = stream.getVideoTracks()[0];
+      // replace sender track
+      const sender = pc.current.getSenders().find((s) => s.track && s.track.kind === 'video');
+      if (sender) {
+        originalVideoTrackRef.current = sender.track;
+        sender.replaceTrack(track);
+        screenSenderRef.current = sender;
+        track.onended = () => {
+          // restore
+          if (originalVideoTrackRef.current) sender.replaceTrack(originalVideoTrackRef.current);
+        };
+      }
+    } catch (e) { console.warn('screen share failed', e); }
   };
 
   // copy to clipboard
@@ -459,7 +495,7 @@ export default function App() {
       offset += chunk.byteLength;
       outgoingFileQueue.current[transferId].offset = offset;
       const prog = Math.round((offset / file.size) * 100);
-      setFileTransfers((t) => ({ ...t, [transferId]: { ...(t[transferId] || {}), progress: prog, state: "sending" } }));
+      setFileTransfers((t) => ({ ...t, [transferId]: { ...(t[transferId] || {}), progress: prog, state: "sending", meta: t[transferId]?.meta || q.meta } }));
     };
     try {
       while (offset < file.size) {
@@ -485,7 +521,7 @@ export default function App() {
     }
   };
 
-  // UI file input handler
+  // UI file input handler: ensure files are handled one by one (already awaited in loop)
   const handleFileInput = async (e) => {
     const files = Array.from(e.target.files || []);
     for (const f of files) await sendFile(f, activeAlbum);
@@ -536,61 +572,109 @@ export default function App() {
     }
   };
 
-  return (
-    <div className="app-grid">
-      <aside className="sidebar glass-panel">
-        <h1 className="logo">tx</h1>
-        <Tx />
-        <button onClick={createConnection}>📞 Make Call (Ctrl+Q)</button>
-        <button onClick={scanning ? stopQRScan : startQRScan}>{scanning ? "✖ Stop Scan (Ctrl+K)" : "📷 Scan QR (Ctrl+K)"}</button>
-        <button onClick={toggleMute}>{muted ? "🔊 Unmute (Ctrl+B)" : "🔇 Mute (Ctrl+B)"}</button>
-        <button onClick={toggleVideo}>{videoOn ? "🙈 Hide Camera (Ctrl+E)" : "📸 Show Camera (Ctrl+E)"}</button>
-        <button onClick={endCall}>❌ End Call (Esc)</button>
-        <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>🌓 Toggle Theme</button>
-        <p className="status">{status}</p>
+  // download helper for receiver
+  const downloadFile = async (fileId, name) => {
+    try {
+      const blob = await getFileBlob(fileId);
+      if (!blob) return alert('File not found');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name || 'file';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) { console.error(e); alert('Download failed'); }
+  };
 
-        {connectionStats && (
-          <div className="stats">
-            <div>Up: {connectionStats.upKbps} kbps</div>
-            <div>Down: {connectionStats.downKbps} kbps</div>
-            <div>RTT: {connectionStats.rtt}</div>
-            <div>Lost: {connectionStats.packetsLost}</div>
-          </div>
-        )}
+  // UI: hide side panels while connected to avoid overflow on small devices
+  const renderSidebar = () => (
+    <aside className="sidebar glass-panel">
+      <h1 className="logo">tx</h1>
+      <Tx />
+      <button onClick={createConnection}>📞 Make Call (Ctrl+Q)</button>
+      <button onClick={scanning ? stopQRScan : startQRScan}>{scanning ? "✖ Stop Scan (Ctrl+K)" : "📷 Scan QR (Ctrl+K)"}</button>
+      <button onClick={() => { toggleMute(); sendControl('mute'); }}>{muted ? "🔊 Unmute (Ctrl+B)" : "🔇 Mute (Ctrl+B)"}</button>
+      <button onClick={() => { toggleVideo(); sendControl('video-off'); }}>{videoOn ? "🙈 Hide Camera (Ctrl+E)" : "📸 Show Camera (Ctrl+E)"}</button>
+      <button onClick={endCall}>❌ End Call (Esc)</button>
+      <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>🌓 Toggle Theme</button>
+      <button onClick={() => setShowSettings((s) => !s)}>⚙️ Settings</button>
+      <p className="status">{status}</p>
 
-        <div className="perf">
-          <div>CPU score: {cpuScore ?? "n/a"} (Run Ctrl+S)</div>
-          <button onClick={runCpuBench}>Run CPU Benchmark (Ctrl+S)</button>
+      {connectionStats && (
+        <div className="stats">
+          <div>Up: {connectionStats.upKbps} kbps</div>
+          <div>Down: {connectionStats.downKbps} kbps</div>
+          <div>RTT: {connectionStats.rtt}</div>
+          <div>Lost: {connectionStats.packetsLost}</div>
         </div>
+      )}
 
-        <div className="file-controls" style={{ marginTop: 12 }}>
-          <div>Albums</div>
-          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            <button onClick={createAlbum}>+ New Album</button>
-            <button onClick={reloadAlbums}>Refresh</button>
+      <div className="perf">
+        <div>CPU score: {cpuScore ?? "n/a"} (Run Ctrl+S)</div>
+        <button onClick={runCpuBench}>Run CPU Benchmark (Ctrl+S)</button>
+      </div>
+
+      <div className="file-controls" style={{ marginTop: 12 }}>
+        <div>Albums</div>
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <button onClick={createAlbum}>+ New Album</button>
+          <button onClick={reloadAlbums}>Refresh</button>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          {albums.map((a) => (
+            <div key={a.id} style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 6 }}>
+              <div style={{ cursor: "pointer" }} onClick={() => openAlbum(a.id)}>{a.name}</div>
+              <div>
+                <button onClick={() => { setActiveAlbum(a.id); shareAlbum(a); }}>Share</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {showSettings && (
+        <div style={{ marginTop: 12 }}>
+          <h4>Settings</h4>
+          <div>
+            <label>Username: <input value={username} onChange={(e) => { setUsername(e.target.value); localStorage.setItem('username', e.target.value); }} /></label>
           </div>
           <div style={{ marginTop: 8 }}>
-            {albums.map((a) => (
-              <div key={a.id} style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 6 }}>
-                <div style={{ cursor: "pointer" }} onClick={() => openAlbum(a.id)}>{a.name}</div>
-                <div>
-                  <button onClick={() => { setActiveAlbum(a.id); shareAlbum(a); }}>Share</button>
-                </div>
-              </div>
-            ))}
+            <button onClick={() => { setMessages([]); sendControl('clear-chat'); }}>Clear Chat (local + remote)</button>
           </div>
         </div>
-      </aside>
+      )}
+    </aside>
+  );
+
+  return (
+    <div className="app-grid">
+      {/* show sidebar only when NOT connected to reduce overflow on small screens */}
+      {!connected && renderSidebar()}
 
       <main className="content">
-        <div className="video-grid">
-          <div className="video-wrapper">
-            <video ref={localVideoRef} autoPlay playsInline muted />
-            <span className="video-label">{username || "Me"}</span>
+        <div className="video-grid" style={{ position: 'relative' }}>
+          {/* Remote large when connected */}
+          <div className="video-wrapper" style={{ flex: connected ? 2 : 1, minHeight: 280 }}>
+            <video ref={remoteVideoRef} autoPlay playsInline style={{ width: '100%', height: '100%', background: '#000' }} />
+            <span className="video-label">{connected ? (/* prefer showing peer name when available */ 'Peer') : 'Peer'}</span>
+
+            {/* overlay controls on remote video */}
+            {connected && (
+              <div style={{ position: 'absolute', right: 12, top: 12, display: 'flex', gap: 8, zIndex: 20 }}>
+                <button onClick={() => { toggleMute(); sendControl('mute'); }}>{muted ? 'Unmute' : 'Mute'}</button>
+                <button onClick={() => { toggleVideo(); sendControl('video-off'); }}>{videoOn ? 'Hide Camera' : 'Show Camera'}</button>
+                <button onClick={startScreenShare}>Share Screen</button>
+                <button onClick={endCall}>End Call</button>
+              </div>
+            )}
           </div>
-          <div className="video-wrapper">
-            <video ref={remoteVideoRef} autoPlay playsInline />
-            <span className="video-label">Peer</span>
+
+          {/* local small picture-in-picture */}
+          <div className="video-wrapper" style={{ width: connected ? 200 : 'auto', height: connected ? 140 : 'auto', position: connected ? 'absolute' : 'relative', right: connected ? 12 : 'auto', bottom: connected ? 12 : 'auto', zIndex: connected ? 30 : 'auto', border: connected ? '2px solid rgba(255,255,255,0.6)' : undefined }}>
+            <video ref={localVideoRef} autoPlay playsInline muted style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+            <span className="video-label">{username || 'Me'}</span>
           </div>
         </div>
 
@@ -684,6 +768,7 @@ export default function App() {
                   <div>
                     {t.state === "error" && <button onClick={() => retryTransfer(id)}>Retry</button>}
                     {t.state !== "done" && t.state !== "error" && <button onClick={() => setFileTransfers((ft)=>({...ft,[id]:{...(ft[id]||{}),state:'cancelled'}}))}>Cancel</button>}
+                    {t.state === 'done' && t.fileId && <button onClick={() => downloadFile(t.fileId, t.meta?.name)}>Download</button>}
                   </div>
                 </div>
                 <progress value={t.progress} max="100" style={{ width: "100%" }} />
@@ -694,38 +779,44 @@ export default function App() {
         </div>
       </main>
 
-      <aside className="sdp-panel glass-panel">
-        {localSDPUrl && (
-          <div>
-            <h4>📤 Share this Link</h4>
-            <textarea readOnly value={localSDPUrl} rows="2" />
-            <div className="QrCode"><QRCodeSVG value={localSDPUrl} size={160} /></div>
-            <div style={{ marginTop: 8 }}>
-              <button onClick={() => copyToClipboard(localSDPUrl)}>Copy Link</button>
+      {/* Show SDP panel if not connected OR a local SDP URL exists (so user can copy/scan) */}
+      {(!connected || localSDPUrl) && (
+        <aside className="sdp-panel glass-panel">
+          {localSDPUrl && (
+            <div>
+              <h4>📤 Share this Link</h4>
+              <textarea readOnly value={localSDPUrl} rows="2" />
+              <div className="QrCode"><QRCodeSVG value={localSDPUrl} size={160} /></div>
+              <div style={{ marginTop: 8 }}>
+                <button onClick={() => { copyToClipboard(localSDPUrl); setStatus('Link copied'); }}>Copy Link</button>
+                <button onClick={() => setLocalSDPUrl("")} style={{ marginLeft: 8 }}>Dismiss</button>
+              </div>
             </div>
-          </div>
-        )}
-        <textarea
-          value={remoteSDP}
-          onChange={(e) => setRemoteSDP(e.target.value)}
-          placeholder="Paste remote SDP URL..."
-        />
-        <button onClick={handleSetRemoteFromInput}>✅ Set Remote</button>
-        <div id="qr-reader" className={scanning ? "qr-visible" : "qr-hidden"} />
-      </aside>
+          )}
+          <textarea
+            value={remoteSDP}
+            onChange={(e) => setRemoteSDP(e.target.value)}
+            placeholder="Paste remote SDP URL..."
+          />
+          <button onClick={handleSetRemoteFromInput}>✅ Set Remote</button>
+          <div id="qr-reader" className={scanning ? "qr-visible" : "qr-hidden"} />
+        </aside>
+      )}
 
-      <aside className="call-history glass-panel">
-        <h4>📞 Recent Calls</h4>
-        <ul>
-          {recentCalls.map((call, i) => (
-            <li key={i}>
-              <strong>{call.username || "Anonymous"}</strong>
-              <br />
-              {new Date(call.timestamp).toLocaleString()}
-            </li>
-          ))}
-        </ul>
-      </aside>
+      {!connected && (
+        <aside className="call-history glass-panel">
+          <h4>📞 Recent Calls</h4>
+          <ul>
+            {recentCalls.map((call, i) => (
+              <li key={i}>
+                <strong>{call.username || "Anonymous"}</strong>
+                <br />
+                {new Date(call.timestamp).toLocaleString()}
+              </li>
+            ))}
+          </ul>
+        </aside>
+      )}
     </div>
   );
 }
